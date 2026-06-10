@@ -67,13 +67,24 @@ TARGET_COL = "annualised_vol"
 
 
 def train_models(panel: pd.DataFrame) -> dict:
-    """Train multiple regressors and return comparison metrics."""
+    """
+    Train multiple regressors and return comparison metrics.
+
+    The panel is sorted chronologically before TimeSeriesSplit so that
+    cross-validation always trains on the past and tests on the future
+    (no look-ahead leakage). CV-RMSE is the honest out-of-sample metric;
+    in-sample R² is reported for reference only.
+    """
     df = panel.dropna(subset=FEATURE_COLS + [TARGET_COL]).copy()
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.sort_values("date")
+
     X = df[FEATURE_COLS]
     y = df[TARGET_COL]
 
     scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
+    X_scaled = pd.DataFrame(scaler.fit_transform(X), columns=FEATURE_COLS, index=X.index)
 
     models = {
         "Linear Regression": LinearRegression(),
@@ -89,8 +100,10 @@ def train_models(panel: pd.DataFrame) -> dict:
     results = {}
 
     for name, model in models.items():
-        X_in = X_scaled if name == "Linear Regression" else X.values
-        cv_scores = cross_val_score(model, X_in, y, cv=tscv, scoring="neg_root_mean_squared_error")
+        X_in = X_scaled if name == "Linear Regression" else X
+        cv_scores = cross_val_score(
+            model, X_in, y, cv=tscv, scoring="neg_root_mean_squared_error",
+        )
         model.fit(X_in, y)
         y_pred = model.predict(X_in)
         results[name] = {
@@ -109,6 +122,18 @@ def train_models(panel: pd.DataFrame) -> dict:
         "feature_names": FEATURE_COLS,
         "scaler": scaler,
     }
+
+
+def predict_volatility(model_output: dict, feature_values: dict,
+                       model_name: str = "Random Forest") -> float:
+    """Predict volatility for a single hypothetical company profile."""
+    model = model_output["results"][model_name]["model"]
+    X_new = pd.DataFrame([feature_values])[FEATURE_COLS]
+    if model_name == "Linear Regression":
+        X_new = pd.DataFrame(
+            model_output["scaler"].transform(X_new), columns=FEATURE_COLS,
+        )
+    return float(model.predict(X_new)[0])
 
 
 def get_feature_importance(model_output: dict, model_name: str = "Random Forest") -> pd.DataFrame:
@@ -164,11 +189,11 @@ def cluster_companies(esg: pd.DataFrame, n_clusters: int = 4) -> pd.DataFrame:
     esg = esg.copy()
     esg["esg_cluster"] = km.fit_predict(X_scaled)
 
-    label_map = {}
-    for cid in range(n_clusters):
-        mask = esg["esg_cluster"] == cid
-        avg = esg.loc[mask, "esg_score"].mean()
-        label_map[cid] = avg
+    # Rank clusters by average ESG score and assign readable labels
+    label_map = {
+        cid: esg.loc[esg["esg_cluster"] == cid, "esg_score"].mean()
+        for cid in range(n_clusters)
+    }
     rank = sorted(label_map, key=lambda k: label_map[k], reverse=True)
     names = ["ESG Leader", "Strong Performer", "Transitioning", "Laggard"]
     name_map = {rank[i]: names[min(i, len(names) - 1)] for i in range(len(rank))}
@@ -209,20 +234,23 @@ def plot_sector_esg(benchmarks: pd.DataFrame, path: str | None = None):
 # ── Decarbonisation Charts ───────────────────────────────────────────────────
 
 def plot_decarbonisation(trajectory: pd.DataFrame, esg: pd.DataFrame, path: str | None = None):
-    """Plot emissions reduction trajectories by sector."""
+    """Plot emissions reduction trajectories by sector (indexed to first year)."""
     merged = trajectory.merge(esg[["ticker", "sector", "name"]], on="ticker")
     fig, ax = plt.subplots(figsize=(10, 6))
 
     for sector in merged["sector"].unique():
         sub = merged[merged["sector"] == sector]
-        agg = sub.groupby("year")["emissions_ktco2e"].sum()
+        agg = sub.groupby("year")["emissions_ktco2e"].sum().sort_index()
         base = agg.iloc[0]
+        if base <= 0:
+            continue
         pct = (agg / base) * 100
         ax.plot(pct.index, pct.values, marker="o", label=sector, linewidth=2)
 
-    ax.axhline(y=50, color="red", linestyle="--", alpha=0.6, label="Paris-aligned 2030 target (−50 %)")
+    ax.axhline(y=50, color="red", linestyle="--", alpha=0.6,
+               label="Paris-aligned 2030 target (−50 %)")
     ax.set_xlabel("Year")
-    ax.set_ylabel("Emissions (indexed to 2020 = 100)")
+    ax.set_ylabel("Emissions (indexed to base year = 100)")
     ax.set_title("Sector Decarbonisation Trajectories")
     ax.legend(fontsize=8)
     plt.tight_layout()
@@ -279,6 +307,7 @@ if __name__ == "__main__":
     print(out["benchmarks"])
 
     if "models" in out:
-        print("\nModel comparison:")
+        print("\nModel comparison (CV-RMSE is the out-of-sample metric):")
         for name, res in out["models"]["results"].items():
-            print(f"  {name:25s}  RMSE={res['rmse']:.4f}  R²={res['r2']:.3f}  CV-RMSE={res['cv_rmse']:.4f}")
+            print(f"  {name:25s}  RMSE={res['rmse']:.4f}  R²={res['r2']:.3f}  "
+                  f"CV-RMSE={res['cv_rmse']:.4f} (±{res['cv_rmse_std']:.4f})")

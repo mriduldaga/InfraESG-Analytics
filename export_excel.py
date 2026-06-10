@@ -41,7 +41,7 @@ def _auto_width(ws):
             if col_letter is None and hasattr(cell, "column_letter"):
                 col_letter = cell.column_letter
             try:
-                val = str(cell.value) if cell.value else ""
+                val = str(cell.value) if cell.value is not None else ""
                 max_len = max(max_len, len(val))
             except Exception:
                 pass
@@ -77,10 +77,11 @@ def generate_report():
         ("Total Companies", len(esg)),
         ("Sectors Covered", esg["sector"].nunique()),
         ("Average ESG Score", round(esg["esg_score"].mean(), 1)),
-        ("Portfolio Carbon Intensity (tCO₂e/€M)", round(esg["carbon_intensity"].mean(), 1)),
+        ("Avg Carbon Intensity (tCO₂e/€M rev)", round(esg["carbon_intensity"].mean(), 1)),
         ("EU Taxonomy Aligned (%)", pai_report["taxonomy"]["portfolio_aligned_pct"]),
         ("SBTi-Validated Companies", pai_report["taxonomy"]["sbti_validated_count"]),
         ("SFDR Red Flags", pai_report["summary"]["red_flags"]),
+        ("SFDR Data Gaps (disclosed)", pai_report["summary"]["data_gaps"]),
     ]
     for i, (label, val) in enumerate(summary_data, 3):
         ws.cell(row=i, column=1, value=label).font = Font(bold=True)
@@ -95,12 +96,16 @@ def generate_report():
         "esg_score", "env_score", "social_score", "gov_score",
         "carbon_intensity", "renewable_energy_pct",
     ]
-    _write_df(ws2, esg[score_cols].sort_values("esg_score", ascending=False))
+    df2 = esg[score_cols].sort_values("esg_score", ascending=False).copy()
+    df2["carbon_intensity"] = df2["carbon_intensity"].round(1)
+    _write_df(ws2, df2)
     _auto_width(ws2)
 
     # ── Sheet 3: SFDR PAI Indicators ──────────────────────────────────────
     ws3 = wb.create_sheet("SFDR PAI")
-    pai_df = pai_report["pai_indicators"][["pai_id", "indicator", "metric", "value", "unit", "status"]]
+    pai_df = pai_report["pai_indicators"][
+        ["pai_id", "indicator", "metric", "value", "unit", "status"]
+    ]
     _write_df(ws3, pai_df)
     _auto_width(ws3)
 
@@ -117,14 +122,15 @@ def generate_report():
     # ── Sheet 5: Decarbonisation ──────────────────────────────────────────
     ws5 = wb.create_sheet("Decarbonisation")
     pivot = trajectory.pivot(index="ticker", columns="year", values="emissions_ktco2e")
+    year_cols = sorted(pivot.columns)
+    first_year, last_year = str(year_cols[0]), str(year_cols[-1])
     pivot.columns = [str(c) for c in pivot.columns]
     pivot = pivot.reset_index()
     merged = esg[["ticker", "name", "sector"]].merge(pivot, on="ticker")
-    if "2020" in merged.columns and "2023" in merged.columns:
-        merged["reduction_pct"] = round(
-            (1 - merged["2023"] / merged["2020"]) * 100, 1
-        )
-    _write_df(ws5, merged.sort_values("reduction_pct", ascending=False) if "reduction_pct" in merged.columns else merged)
+    merged["reduction_pct"] = round(
+        (1 - merged[last_year] / merged[first_year]) * 100, 1
+    )
+    _write_df(ws5, merged.sort_values("reduction_pct", ascending=False))
     _auto_width(ws5)
 
     # ── Sheet 6: Governance & Social ──────────────────────────────────────

@@ -14,7 +14,8 @@ from config import get_esg_dataframe, get_emissions_trajectory_df, SECTORS, PAI_
 from sfdr_pai import generate_pai_report, compute_taxonomy_alignment
 from analysis import (
     cluster_companies, sector_benchmarks,
-    train_models, get_feature_importance, FEATURE_COLS, TARGET_COL,
+    train_models, get_feature_importance, predict_volatility,
+    FEATURE_COLS, TARGET_COL,
 )
 
 # ── Page config ──────────────────────────────────────────────────────────────
@@ -49,6 +50,12 @@ def load_data():
     return esg, trajectory, panel
 
 
+@st.cache_resource(show_spinner="Training risk models …")
+def get_trained_models(panel_hash: int, _panel: pd.DataFrame) -> dict:
+    """Train once per panel dataset, then reuse across reruns."""
+    return train_models(_panel)
+
+
 esg, trajectory, panel = load_data()
 pai_report = generate_pai_report(esg)
 taxonomy = compute_taxonomy_alignment(esg)
@@ -57,8 +64,7 @@ benchmarks = sector_benchmarks(esg)
 # ── Sidebar ──────────────────────────────────────────────────────────────────
 
 with st.sidebar:
-    st.image("https://img.icons8.com/fluency/96/deciduous-tree.png", width=60)
-    st.title("InfraESG Analytics")
+    st.title("🌿 InfraESG Analytics")
     st.caption("ESG Risk Assessment & Decarbonisation Tracking for Infrastructure Investments")
     st.divider()
 
@@ -76,6 +82,10 @@ with st.sidebar:
     st.markdown("Built by **Mridul Daga**")
 
 esg_filtered = esg[esg["sector"].isin(sector_filter)]
+
+if esg_filtered.empty:
+    st.warning("Select at least one sector in the sidebar to display the dashboard.")
+    st.stop()
 
 # ── Tabs ─────────────────────────────────────────────────────────────────────
 
@@ -100,9 +110,10 @@ with tab1:
     c3.metric(
         "Carbon Intensity",
         f"{esg_filtered['carbon_intensity'].mean():.0f}",
-        help="tCO₂e per €M revenue (weighted average)",
+        help="tCO₂e per €M revenue (average across selected companies)",
     )
-    c4.metric("Taxonomy Aligned", f"{taxonomy['portfolio_aligned_pct']}%")
+    c4.metric("Taxonomy Aligned", f"{taxonomy['portfolio_aligned_pct']}%",
+              help="Market-cap-weighted, full portfolio")
     c5.metric("SBTi Validated", f"{taxonomy['sbti_validated_count']}/{len(esg)}")
 
     st.divider()
@@ -136,7 +147,9 @@ with tab1:
         st.plotly_chart(fig, use_container_width=True)
 
     st.subheader("Portfolio ESG Heatmap")
-    heat_data = esg_filtered.set_index("name")[["env_score", "social_score", "gov_score"]].sort_values("env_score", ascending=False)
+    heat_data = esg_filtered.set_index("name")[
+        ["env_score", "social_score", "gov_score"]
+    ].sort_values("env_score", ascending=False)
     fig = px.imshow(
         heat_data.values,
         x=["Environmental", "Social", "Governance"],
@@ -234,20 +247,21 @@ with tab3:
 
     traj_merged = trajectory.merge(esg[["ticker", "name", "sector", "has_sbti"]], on="ticker")
     traj_filtered = traj_merged[traj_merged["sector"].isin(sector_filter)]
+    year_min, year_max = int(trajectory["year"].min()), int(trajectory["year"].max())
 
     col_l, col_r = st.columns(2)
 
     with col_l:
         st.subheader("Sector Emissions Trajectories")
         sector_agg = traj_filtered.groupby(["sector", "year"])["emissions_ktco2e"].sum().reset_index()
-        base = sector_agg[sector_agg["year"] == 2020].set_index("sector")["emissions_ktco2e"]
+        base = sector_agg[sector_agg["year"] == year_min].set_index("sector")["emissions_ktco2e"]
         sector_agg["indexed"] = sector_agg.apply(
-            lambda r: r["emissions_ktco2e"] / base.get(r["sector"], 1) * 100, axis=1,
+            lambda r: r["emissions_ktco2e"] / base.get(r["sector"], np.nan) * 100, axis=1,
         )
         fig = px.line(
             sector_agg, x="year", y="indexed", color="sector",
             markers=True,
-            labels={"indexed": "Emissions (2020 = 100)", "year": "Year"},
+            labels={"indexed": f"Emissions ({year_min} = 100)", "year": "Year"},
             color_discrete_sequence=px.colors.qualitative.Set2,
         )
         fig.add_hline(y=50, line_dash="dash", line_color="red",
@@ -256,19 +270,20 @@ with tab3:
         st.plotly_chart(fig, use_container_width=True)
 
     with col_r:
-        st.subheader("Company-Level Reductions (2020→2023)")
+        st.subheader(f"Company-Level Reductions ({year_min}→{year_max})")
         pivot = traj_filtered.pivot_table(
             index=["ticker", "name", "sector", "has_sbti"],
             columns="year", values="emissions_ktco2e",
         ).reset_index()
-        if 2020 in pivot.columns and 2023 in pivot.columns:
-            pivot["reduction_pct"] = round((1 - pivot[2023] / pivot[2020]) * 100, 1)
+        if year_min in pivot.columns and year_max in pivot.columns:
+            pivot["reduction_pct"] = round((1 - pivot[year_max] / pivot[year_min]) * 100, 1)
             pivot_sorted = pivot.sort_values("reduction_pct", ascending=False)
             fig = px.bar(
                 pivot_sorted, x="reduction_pct", y="name", orientation="h",
                 color="has_sbti",
                 color_discrete_map={True: COLORS["green"], False: COLORS["grey"]},
-                labels={"reduction_pct": "Emissions Reduction (%)", "name": "", "has_sbti": "SBTi Validated"},
+                labels={"reduction_pct": "Emissions Reduction (%)", "name": "",
+                        "has_sbti": "SBTi Validated"},
             )
             fig.update_layout(height=550, yaxis=dict(tickfont=dict(size=9)))
             st.plotly_chart(fig, use_container_width=True)
@@ -283,6 +298,7 @@ with tab3:
         sbti_counts = sbti_df["SBTi Status"].value_counts()
         fig = px.pie(
             values=sbti_counts.values, names=sbti_counts.index,
+            color=sbti_counts.index,
             color_discrete_map={"Validated": COLORS["green"], "Not Validated": COLORS["grey"]},
             hole=0.4,
         )
@@ -291,7 +307,8 @@ with tab3:
 
     with c2:
         nz = esg_filtered.groupby("net_zero_year").size().reset_index(name="count")
-        fig = px.bar(nz, x="net_zero_year", y="count", labels={"net_zero_year": "Net Zero Target Year", "count": "Companies"})
+        fig = px.bar(nz, x="net_zero_year", y="count",
+                     labels={"net_zero_year": "Net Zero Target Year", "count": "Companies"})
         fig.update_layout(height=300)
         st.plotly_chart(fig, use_container_width=True)
 
@@ -301,20 +318,27 @@ with tab3:
 # ══════════════════════════════════════════════════════════════════════════════
 with tab4:
     st.header("SFDR Principal Adverse Impact Indicators")
-    st.caption("Mandatory PAI disclosure under SFDR (EU 2019/2088)")
+    st.caption(
+        "Mandatory PAI disclosure under SFDR (EU 2019/2088). "
+        "Computed for an illustrative €1bn portfolio weighted by market cap. "
+        "⚪ indicators are disclosed as data gaps — permitted under SFDR "
+        "best-efforts provisions when issuer data is unavailable."
+    )
 
     pai = pai_report["pai_indicators"]
     summary = pai_report["summary"]
 
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("Red Flags", summary["red_flags"], help="Requires immediate attention")
     c2.metric("Warnings", summary["warnings"], help="Monitor and improve")
     c3.metric("Compliant", summary["compliant"], help="Meets thresholds")
+    c4.metric("Data Gaps", summary["data_gaps"], help="Disclosed per SFDR best-efforts")
 
     st.divider()
 
     for _, row in pai.iterrows():
-        with st.expander(f"{row['status']} PAI {row['pai_id']}: {row['indicator']}", expanded=row['status'] == '🔴'):
+        with st.expander(f"{row['status']} PAI {row['pai_id']}: {row['indicator']}",
+                         expanded=row["status"] == "🔴"):
             c1, c2, c3 = st.columns([3, 1, 1])
             c1.write(f"**Metric:** {row['metric']}")
             c2.write(f"**Value:** {row['value']}")
@@ -331,8 +355,10 @@ with tab4:
     st.subheader("Taxonomy Alignment by Sector")
     tax_sector = taxonomy["by_sector"].reset_index()
     fig = go.Figure()
-    fig.add_trace(go.Bar(x=tax_sector["sector"], y=tax_sector["eligible"], name="Eligible", marker_color=COLORS["light_green"]))
-    fig.add_trace(go.Bar(x=tax_sector["sector"], y=tax_sector["aligned"], name="Aligned", marker_color=COLORS["green"]))
+    fig.add_trace(go.Bar(x=tax_sector["sector"], y=tax_sector["eligible"],
+                         name="Eligible", marker_color=COLORS["light_green"]))
+    fig.add_trace(go.Bar(x=tax_sector["sector"], y=tax_sector["aligned"],
+                         name="Aligned", marker_color=COLORS["green"]))
     fig.update_layout(barmode="group", height=350, yaxis_title="Percentage (%)")
     st.plotly_chart(fig, use_container_width=True)
 
@@ -344,18 +370,23 @@ with tab5:
     st.header("ESG-Driven Volatility Risk Model")
 
     if panel is not None and TARGET_COL in panel.columns:
-        model_output = train_models(panel)
+        model_output = get_trained_models(len(panel), panel)
         results = model_output["results"]
 
         st.subheader("Model Comparison")
+        st.caption(
+            "CV-RMSE (TimeSeriesSplit) is the honest out-of-sample metric — "
+            "train on the past, test on the future. In-sample R² is shown "
+            "for reference only."
+        )
         comp_rows = []
         for name, res in results.items():
             comp_rows.append({
                 "Model": name,
-                "RMSE": round(res["rmse"], 4),
+                "RMSE (in-sample)": round(res["rmse"], 4),
                 "MAE": round(res["mae"], 4),
-                "R²": round(res["r2"], 3),
-                "CV-RMSE": round(res["cv_rmse"], 4),
+                "R² (in-sample)": round(res["r2"], 3),
+                "CV-RMSE (out-of-sample)": round(res["cv_rmse"], 4),
             })
         comp_df = pd.DataFrame(comp_rows)
         st.dataframe(comp_df, use_container_width=True, hide_index=True)
@@ -389,31 +420,33 @@ with tab5:
 
         st.divider()
         st.subheader("Interactive Volatility Predictor")
-        st.caption("Adjust ESG parameters to predict portfolio volatility")
+        st.caption("Adjust ESG parameters to predict annualised volatility for a hypothetical company")
 
         pc1, pc2, pc3 = st.columns(3)
         esg_input = pc1.slider("ESG Score", 30, 95, 70)
         env_input = pc1.slider("Environmental Score", 30, 95, 70)
+        tax_input = pc1.slider("Taxonomy Aligned %", 0, 100, 40)
         soc_input = pc2.slider("Social Score", 30, 95, 65)
         gov_input = pc2.slider("Governance Score", 30, 95, 70)
-        ci_input = pc3.slider("Carbon Intensity", 0, 2000, 500)
-        ren_input = pc3.slider("Renewable Energy %", 0, 100, 50)
-        tax_input = pc1.slider("Taxonomy Aligned %", 0, 100, 40)
         bd_input = pc2.slider("Board Diversity %", 10, 60, 33)
+        ci_input = pc3.slider("Carbon Intensity (tCO₂e/€M)", 0, 2000, 500)
+        ren_input = pc3.slider("Renewable Energy %", 0, 100, 50)
         bi_input = pc3.slider("Board Independence %", 50, 100, 85)
 
         if st.button("Predict Volatility", type="primary"):
-            input_arr = np.array([[
-                esg_input, env_input, soc_input, gov_input,
-                ci_input, ren_input, tax_input, bd_input, bi_input,
-            ]])
-            rf = results["Random Forest"]["model"]
-            pred = rf.predict(input_arr)[0]
+            pred = predict_volatility(model_output, {
+                "esg_score": esg_input, "env_score": env_input,
+                "social_score": soc_input, "gov_score": gov_input,
+                "carbon_intensity": ci_input, "renewable_energy_pct": ren_input,
+                "taxonomy_aligned_pct": tax_input, "board_diversity_pct": bd_input,
+                "board_independence_pct": bi_input,
+            })
             risk_level = "Low" if pred < 0.25 else "Medium" if pred < 0.40 else "High"
-            color = COLORS["green"] if risk_level == "Low" else COLORS["amber"] if risk_level == "Medium" else COLORS["red"]
+            color = (COLORS["green"] if risk_level == "Low"
+                     else COLORS["amber"] if risk_level == "Medium" else COLORS["red"])
             st.markdown(
                 f"### Predicted Annualised Volatility: "
-                f"<span style='color:{color}'>{pred:.4f} ({risk_level} Risk)</span>",
+                f"<span style='color:{color}'>{pred:.1%} ({risk_level} Risk)</span>",
                 unsafe_allow_html=True,
             )
 
@@ -424,12 +457,12 @@ with tab5:
         )
         st.markdown("""
         **Model Architecture:**
-        - **Features:** ESG scores (E/S/G), carbon intensity, renewable energy %, 
+        - **Features:** ESG scores (E/S/G), carbon intensity, renewable energy %,
           taxonomy alignment, board diversity & independence
-        - **Target:** Annualised realised volatility (rolling 21-day, √252 scaled)
+        - **Target:** Annualised realised volatility (monthly, √252 scaled)
         - **Models:** Linear Regression, Random Forest, Gradient Boosting
-        - **Validation:** TimeSeriesSplit 5-fold cross-validation
-        - **Dataset:** ~1,200 company-month observations (25 companies × ~48 months)
+        - **Validation:** TimeSeriesSplit 5-fold cross-validation (no look-ahead)
+        - **Dataset:** ~1,500+ company-month observations (25 companies × 60+ months)
         """)
 
 
@@ -453,9 +486,8 @@ with tab6:
             ("Social", "social_score", 60),
             ("Governance", "gov_score", 65),
         ]:
-            val = co[field]
-            delta = f"{val - threshold:+d} vs threshold"
-            st.metric(label, val, delta)
+            val = int(co[field])
+            st.metric(label, val, f"{val - threshold:+.0f} vs threshold")
 
     with col2:
         st.subheader("Climate & Energy")
@@ -463,7 +495,7 @@ with tab6:
         st.metric("Renewable Energy", f"{co['renewable_energy_pct']}%")
         st.metric("EU Taxonomy Aligned", f"{co['taxonomy_aligned_pct']}%")
         st.metric("SBTi Validated", "Yes" if co["has_sbti"] else "No")
-        st.metric("Net Zero Target", co["net_zero_year"])
+        st.metric("Net Zero Target", int(co["net_zero_year"]))
 
     with col3:
         st.subheader("Social & Governance")
